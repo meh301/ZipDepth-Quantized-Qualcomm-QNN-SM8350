@@ -1,23 +1,38 @@
 # ZipDepth NPU RGB Camera Demo
 
 Standalone Android demonstration of ZipDepth running on the Snapdragon 888
-Hexagon NPU. It uses only the phone's main rear RGB camera; no XREAL hardware,
+Hexagon NPU. It can use any Camera2 camera that exposes a YUV RGB stream; no XREAL hardware,
 USB camera code, Basalt, SLAM, stereo processing, or parent-project files are
 referenced at build or runtime.
 
 ## What the demo shows
 
-- Live rear RGB camera preview.
-- Live 384×384 relative-depth visualization with a stable percentile window.
-- Observed processed FPS and camera FPS.
-- QNN/HTP inference time and its theoretical maximum FPS.
-- RGB preprocessing, depth postprocessing, native total, and end-to-end
-  pipeline timing.
-- Presented, dropped, and failed frame counts.
-- QNN initialization time and the active backend mode.
+The screen is a portrait split: the **top half is the selected live RGB camera
+feed**, the **bottom half is the ZipDepth depth map** the NPU produces from it.
+Both halves are rendered from the *same* upright, center-cropped 384×384 square —
+the exact tensor the model consumes — so the RGB feed and the depth map are
+framed identically and always correctly oriented, with no view-transform math.
 
-The inference loop uses latest-frame backpressure: camera preview remains fluid,
-and stale analysis frames are discarded if the NPU worker is still busy.
+- Live selectable RGB camera feed (rotated upright natively, not via a TextureView
+  transform).
+- Camera selector showing Camera2 ID, facing direction, focal length, and the
+  full-sensor-aspect analysis resolution. Depth-only entries are disabled.
+- Live 384×384 relative-depth visualization with a stable percentile window.
+- Live camera FPS and delivered depth FPS.
+- QNN/HTP `OrtRun`, complete native processing, dispatch round-trip, and
+  capture-to-result latency.
+- A visible `HTP WAIT` timer if a camera/HVX pipeline stalls Qualcomm FastRPC.
+
+The RGB feed is painted on the camera thread for every frame, independent of the
+NPU, so the camera is visibly live even while the model initializes (or if init
+fails). Depth uses latest-frame backpressure: stale analysis frames are dropped
+while the NPU worker is busy.
+
+If the NPU cannot initialize, the depth half shows the exact error instead of a
+silent "waiting" state; the RGB feed keeps running. Check `adb logcat -s
+ZipDepthDemo onnxruntime` for the underlying ORT/QNN reason. If depth ever reads
+inverted (far surfaces warm), flip the single `1.0f -` in the postprocess loop
+of `zipdepth_jni.c`.
 
 ## Target
 
@@ -55,7 +70,8 @@ Install it with:
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Grant camera permission when prompted and hold the phone in landscape.
+Grant camera permission when prompted and hold the phone in portrait: the top
+half shows the live RGB feed, the bottom half shows the live ZipDepth depth map.
 
 ## Isolation from the XREAL project
 
@@ -69,17 +85,21 @@ Android SDK path. Android Studio recreates it automatically on another machine.
 
 ## Interpretation of the metrics
 
-- **Observed FPS** is the real delivered depth-map rate, including camera
-  acquisition and scheduling.
-- **NPU inference** measures only `OrtApi::Run` on the QNN EPContext graph.
-- **FPS max** is `1000 / NPU inference milliseconds`; it is a compute ceiling,
-  not the camera-limited application rate.
-- **Native total** includes YUV→RGB preprocessing, NPU execution, percentile
-  normalization, colormapping, and the JNI pixel copy.
-- **Pipeline** is measured around the entire native call and Bitmap update on
-  the inference worker.
-- **Dropped** counts intentionally discarded stale frames; this is expected
-  whenever camera FPS exceeds inference throughput.
+- **CAM** is the delivered Camera2 frame rate.
+- **DEPTH** is the delivered depth-map rate after latest-frame backpressure.
+- **HTP** measures only `OrtApi::Run` on the QNN EPContext graph.
+- **NATIVE** includes RGB tensor conversion, HTP execution, percentile
+  normalization, colormapping, and JNI output copying in the NPU process.
+- **ROUND** covers shared-memory dispatch, native processing, and result IPC.
+- **E2E** starts before the selected camera frame is converted and copied, and
+  ends when its depth result reaches the activity.
+
+The selected analysis stream follows the active sensor's native aspect ratio.
+The app requests 1.0x zoom, disables electronic and optical stabilization, then
+center-crops the largest square exactly once and resizes it to the model's
+384x384 input. If Camera2 exposes real-time distortion correction, the app
+requests `DISTORTION_CORRECTION_MODE_FAST`; it also logs the selected camera's
+reported intrinsic calibration and distortion coefficients.
 
 Depth values are relative/non-metric. The display uses the 2nd–98th percentile
 range with temporal smoothing; nearby surfaces are mapped to warm colors.

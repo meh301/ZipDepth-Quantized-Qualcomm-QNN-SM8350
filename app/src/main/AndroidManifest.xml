@@ -15,12 +15,17 @@
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
             android:exported="true"
-            android:screenOrientation="landscape">
+            android:screenOrientation="portrait">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".ZipDepthService"
+            android:exported="false"
+            android:process=":zipdepth_npu" />
 
         <!-- Public Qualcomm vendor libraries needed to reach the Hexagon HTP. -->
         <uses-native-library android:name="libcdsprpc.so" android:required="false" />
