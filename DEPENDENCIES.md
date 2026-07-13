@@ -19,10 +19,16 @@ The ONNX Runtime C headers under `app/src/main/cpp/ort/` match the vendored
 1.27.0 AAR. OpenCV 4.12.0 is resolved from Maven Central and is therefore not
 listed as a vendored binary.
 
-## Licensing warning
+## Licensing and redistribution
 
-ZipDepth and ONNX Runtime use the MIT License. The Qualcomm QAIRT/QNN artifacts
-are supplied under Qualcomm terms and are not relicensed by this repository.
-Confirm that your agreement permits public redistribution of these exact files
-before pushing their LFS objects or distributing an APK. See
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+The original app code is 0BSD-licensed; ZipDepth and ONNX Runtime use the MIT
+License. The Qualcomm QAIRT/QNN objects remain proprietary and are not
+relicensed by this repository.
+
+Qualcomm's AI Stack License permits object-code distribution when the QAIRT
+software is incorporated into an application, but prohibits standalone QAIRT
+distribution. These files are present only as components of this Android app.
+Keep their notices intact, do not publish them as a separate runtime or SDK, and
+review the agreement supplied with the exact SDK package before substituting
+artifacts. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and
+[`LICENSES/Qualcomm-QAIRT-TERMS.md`](LICENSES/Qualcomm-QAIRT-TERMS.md).

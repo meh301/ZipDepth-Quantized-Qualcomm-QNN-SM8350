@@ -281,15 +281,28 @@ for training, evaluation, original checkpoints, and the paper citation:
 
 ## Licensing and redistribution
 
-ZipDepth is published under the MIT License. ONNX Runtime is MIT-licensed and
-OpenCV 4.12 is Apache-2.0-licensed. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+The original application source is released under the permissive
+[BSD Zero Clause License](LICENSE) (`0BSD`). Third-party components retain their
+own licenses:
 
-The repository also contains Qualcomm QAIRT/QNN binary artifacts. Those files
-are **not** covered by the ZipDepth or ONNX Runtime licenses. Before making a
-public fork or distributing an APK, verify that your Qualcomm agreement permits
-redistribution of the specific runtime artifacts. No license for the original
-application code has been selected in this repository yet; add an appropriate
-top-level `LICENSE` before presenting it as an open-source project.
+| Component | License |
+|---|---|
+| ZipDepth NPU Demo application code | 0BSD |
+| ZipDepth model and upstream code | MIT |
+| ONNX Runtime | MIT |
+| OpenCV 4.12 | Apache-2.0 |
+| Qualcomm QAIRT/QNN runtime objects | Qualcomm AI Stack License |
+
+Qualcomm's AI Stack License permits QAIRT software to be distributed and
+sublicensed in object-code form when incorporated into an application; it does
+not permit standalone QAIRT redistribution. The QNN objects in this repository
+are included only as components of this Android app and are expressly excluded
+from the 0BSD grant. Keep Qualcomm's proprietary notices intact and do not
+extract or republish the objects as a separate runtime or SDK.
+
+See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and the
+[`Qualcomm QAIRT licensing reference`](LICENSES/Qualcomm-QAIRT-TERMS.md) for the
+component boundaries and official references.
 
 ## References
 
