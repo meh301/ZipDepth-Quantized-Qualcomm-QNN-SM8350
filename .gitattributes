@@ -1,3 +1,17 @@
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.aar filter=lfs diff=lfs merge=lfs -text
+app/src/main/jniLibs/**/*.so filter=lfs diff=lfs merge=lfs -text
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.gradle text eol=lf
+*.java text eol=lf
+*.json text eol=lf
+*.kt text eol=lf
+*.md text eol=lf
+*.properties text eol=lf
+*.py text eol=lf
+*.xml text eol=lf
 app/libs/onnxruntime-android-qnn-1.27.0.aar filter=lfs diff=lfs merge=lfs -text
 app/src/main/assets/zipdepth.onnx filter=lfs diff=lfs merge=lfs -text
 app/src/main/jniLibs/arm64-v8a/*.so filter=lfs diff=lfs merge=lfs -text

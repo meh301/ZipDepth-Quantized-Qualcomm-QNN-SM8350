@@ -1,17 +1,28 @@
 # Vendored runtime inventory
 
-These files were copied into this standalone repository so it has no dependency
-on the XREAL project tree. SHA-256 values document the exact known-working set.
+The hardware-specific model and runtime artifacts are committed through Git LFS.
+Their hashes document the exact set used for the tested Snapdragon 888 build.
+These files must remain version-matched: replacing one QNN library independently
+can cause initialization errors, incorrect graph placement, or a native crash.
 
-| File | Purpose | SHA-256 |
-|---|---|---|
-| `app/src/main/assets/zipdepth.onnx` | SM8350/V68 ZipDepth EPContext model | `8C4B7BAFF7E72022D4CBFED717FD16F6357EFFFD79D41E9DCBFE4D8DB59155DF` |
-| `app/libs/onnxruntime-android-qnn-1.27.0.aar` | ORT Android with QNN EP | `D814A4927C78439DA4FE599866C980EA853C2D3ECBB7078F897D559D63CCC872` |
-| `app/src/main/jniLibs/arm64-v8a/libQnnHtp.so` | QNN HTP host backend, QAIRT 2.48 | `4EAA10F59FCE051E32012D6B4399C0576F5332C23349B6CC7452F9DCF8F270C7` |
-| `app/src/main/jniLibs/arm64-v8a/libQnnHtpPrepare.so` | QNN graph preparation support, QAIRT 2.48 | `3E408206C9F3F24F60991476EFDFF388A271FF06411C18D02660A6CEAC24CD0A` |
-| `app/src/main/jniLibs/arm64-v8a/libQnnHtpV68Skel.so` | Hexagon V68 DSP skeleton, QAIRT 2.48 | `C479454DC21DC1EE2995AAF922B37882684306F864259EA3C582AA2CFB2F81CA` |
-| `app/src/main/jniLibs/arm64-v8a/libQnnHtpV68Stub.so` | Hexagon V68 host stub, QAIRT 2.48 | `9906A74657BE4C988A93863211D93A392E53266A15FCFD94B9809BE366AD236B` |
-| `app/src/main/jniLibs/arm64-v8a/libQnnSystem.so` | QNN context metadata/runtime, QAIRT 2.48 | `7EE62754B67A1F0F3B1DEFC1C441FF59D5ED4A02BB34F9437DEF7B7C8651062D` |
+| File | Size | Purpose | SHA-256 |
+|---|---:|---|---|
+| `app/src/main/assets/zipdepth.onnx` | 6.62 MiB | INT8 SM8350/v68 ZipDepth EPContext model | `8C4B7BAFF7E72022D4CBFED717FD16F6357EFFFD79D41E9DCBFE4D8DB59155DF` |
+| `app/libs/onnxruntime-android-qnn-1.27.0.aar` | 7.64 MiB | ONNX Runtime 1.27.0 Android AAR with QNN EP | `D814A4927C78439DA4FE599866C980EA853C2D3ECBB7078F897D559D63CCC872` |
+| `app/src/main/jniLibs/arm64-v8a/libQnnHtp.so` | 3.59 MiB | QAIRT 2.48 QNN HTP host backend | `4EAA10F59FCE051E32012D6B4399C0576F5332C23349B6CC7452F9DCF8F270C7` |
+| `app/src/main/jniLibs/arm64-v8a/libQnnHtpPrepare.so` | 83.84 MiB | QAIRT 2.48 HTP graph preparation support | `3E408206C9F3F24F60991476EFDFF388A271FF06411C18D02660A6CEAC24CD0A` |
+| `app/src/main/jniLibs/arm64-v8a/libQnnHtpV68Skel.so` | 9.77 MiB | QAIRT 2.48 Hexagon v68 DSP skeleton | `C479454DC21DC1EE2995AAF922B37882684306F864259EA3C582AA2CFB2F81CA` |
+| `app/src/main/jniLibs/arm64-v8a/libQnnHtpV68Stub.so` | 0.71 MiB | QAIRT 2.48 Hexagon v68 host stub | `9906A74657BE4C988A93863211D93A392E53266A15FCFD94B9809BE366AD236B` |
+| `app/src/main/jniLibs/arm64-v8a/libQnnSystem.so` | 3.87 MiB | QAIRT 2.48 QNN context metadata/runtime | `7EE62754B67A1F0F3B1DEFC1C441FF59D5ED4A02BB34F9437DEF7B7C8651062D` |
 
-The ORT C API header under `app/src/main/cpp/ort/` was extracted from the
-vendored 1.27.0 AAR rather than copied from a different ORT release.
+The ONNX Runtime C headers under `app/src/main/cpp/ort/` match the vendored
+1.27.0 AAR. OpenCV 4.12.0 is resolved from Maven Central and is therefore not
+listed as a vendored binary.
+
+## Licensing warning
+
+ZipDepth and ONNX Runtime use the MIT License. The Qualcomm QAIRT/QNN artifacts
+are supplied under Qualcomm terms and are not relicensed by this repository.
+Confirm that your agreement permits public redistribution of these exact files
+before pushing their LFS objects or distributing an APK. See
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

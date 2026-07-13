@@ -59,7 +59,7 @@ android {
 }
 
 dependencies {
-    // Vendored so this demo does not depend on or modify the XREAL project.
+    // Vendored to keep this hardware-specific reference app self-contained.
     // The transitive QNN 2.42 package is intentionally absent: the EPContext
     // model and native libraries in jniLibs are the matched QAIRT 2.48 set.
     implementation files('libs/onnxruntime-android-qnn-1.27.0.aar')
