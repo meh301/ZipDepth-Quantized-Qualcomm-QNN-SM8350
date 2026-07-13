@@ -61,6 +61,9 @@ class MainActivity : Activity() {
     private lateinit var statusView: TextView
     private lateinit var cameraSelectorView: TextView
     private lateinit var statsView: TextView
+    private lateinit var calibrationButtonView: TextView
+    private lateinit var calibrationStatusView: TextView
+    private lateinit var calibrationController: CameraCalibrationController
 
     private val inferenceExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "ZipDepthInference").apply { priority = Thread.NORM_PRIORITY + 1 }
@@ -78,6 +81,7 @@ class MainActivity : Activity() {
     @Volatile private var modelReady = false
     @Volatile private var resumed = false
     @Volatile private var depthShown = false
+    @Volatile private var calibrationActive = false
 
     private var cameraThread: HandlerThread? = null
     private var cameraHandler: Handler? = null
@@ -163,7 +167,11 @@ class MainActivity : Activity() {
                 View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
                 View.SYSTEM_UI_FLAG_LAYOUT_STABLE
         buildUi()
+        calibrationController = CameraCalibrationController(this) { state ->
+            runOnUiThread { applyCalibrationState(state) }
+        }
         loadCameraOptions()
+        refreshStoredCalibration()
         initializeModel()
     }
 
@@ -178,6 +186,9 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         resumed = false
+        if (::calibrationController.isInitialized && calibrationController.isActive()) {
+            calibrationController.cancel("CALIBRATION CANCELLED — APP LEFT FOREGROUND")
+        }
         closeCamera()
         stopCameraThread()
         super.onPause()
@@ -191,6 +202,7 @@ class MainActivity : Activity() {
         }
         npuService = null
         inferenceExecutor.shutdown()
+        if (::calibrationController.isInitialized) calibrationController.close()
         super.onDestroy()
     }
 
@@ -271,12 +283,116 @@ class MainActivity : Activity() {
                 .apply { setMargins(dp(12), dp(12), dp(12), dp(12)) },
         )
 
+        calibrationButtonView = TextView(this).apply {
+            text = "CALIBRATE CAMERA"
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setPadding(dp(16), dp(11), dp(16), dp(11))
+            setBackgroundColor(0xDD176B5B.toInt())
+            setOnClickListener { toggleCalibration() }
+        }
+        root.addView(
+            calibrationButtonView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER_HORIZONTAL or Gravity.BOTTOM,
+            ).apply { setMargins(dp(12), dp(12), dp(12), dp(18)) },
+        )
+
+        calibrationStatusView = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            gravity = Gravity.CENTER
+            typeface = Typeface.MONOSPACE
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            setBackgroundColor(0xDD111111.toInt())
+            visibility = View.GONE
+        }
+        root.addView(
+            calibrationStatusView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER_HORIZONTAL or Gravity.BOTTOM,
+            ).apply { setMargins(dp(12), dp(12), dp(12), dp(68)) },
+        )
+
         setContentView(root)
     }
 
     private fun setStatus(text: String, show: Boolean) = runOnUiThread {
         statusView.text = text
         statusView.visibility = if (show) View.VISIBLE else View.GONE
+    }
+
+    private fun toggleCalibration() {
+        if (calibrationController.isActive()) {
+            calibrationController.cancel()
+            return
+        }
+        val option = cameraOptions.firstOrNull {
+            it.id == selectedCameraId && it.analysisSize != null
+        }
+        if (option == null) {
+            calibrationStatusView.text = "NO CALIBRATABLE YUV CAMERA"
+            calibrationStatusView.visibility = View.VISIBLE
+            return
+        }
+        synchronized(frameLock) {
+            latestFrame?.let { freeFrames.addLast(it) }
+            latestFrame = null
+        }
+        calibrationController.start(option.id, option.analysisSize!!.width, option.analysisSize.height)
+    }
+
+    private fun applyCalibrationState(state: CalibrationUiState) {
+        val wasActive = calibrationActive
+        calibrationActive = state.active
+        calibrationButtonView.text = when {
+            state.active -> "CANCEL CALIBRATION  ${state.acceptedViews}/${state.targetViews}"
+            state.calibration != null -> "CALIBRATED · RE-CALIBRATE"
+            state.failed -> "RETRY CALIBRATION"
+            else -> "CALIBRATE CAMERA"
+        }
+        calibrationButtonView.setBackgroundColor(
+            when {
+                state.active -> 0xDDBB6A18.toInt()
+                state.failed -> 0xDDA22B35.toInt()
+                else -> 0xDD176B5B.toInt()
+            },
+        )
+        calibrationStatusView.text = state.message
+        calibrationStatusView.setBackgroundColor(
+            if (state.failed) 0xE0991F2A.toInt() else 0xDD111111.toInt(),
+        )
+        calibrationStatusView.visibility = View.VISIBLE
+        refreshStats(force = true)
+        if (wasActive && !state.active && modelReady && resumed) scheduleInferenceDispatch()
+    }
+
+    private fun refreshStoredCalibration() {
+        if (!::calibrationController.isInitialized || !::calibrationButtonView.isInitialized || calibrationActive) return
+        val option = cameraOptions.firstOrNull {
+            it.id == selectedCameraId && it.analysisSize != null
+        }
+        val size = option?.analysisSize
+        val calibration = if (option != null && size != null) {
+            calibrationController.load(option.id, size.width, size.height)
+        } else {
+            null
+        }
+        if (calibration == null) {
+            calibrationButtonView.text = "CALIBRATE CAMERA"
+            calibrationStatusView.visibility = View.GONE
+        } else {
+            calibrationButtonView.text = "CALIBRATED · RE-CALIBRATE"
+            calibrationStatusView.text = calibration.summary()
+            calibrationStatusView.setBackgroundColor(0xDD111111.toInt())
+            calibrationStatusView.visibility = View.VISIBLE
+        }
     }
 
     private fun loadCameraOptions() {
@@ -361,11 +477,15 @@ class MainActivity : Activity() {
     private fun switchCamera(id: String) {
         val option = cameraOptions.firstOrNull { it.id == id && it.analysisSize != null } ?: return
         if (selectedCameraId == id && cameraDevice != null) return
+        if (calibrationController.isActive()) {
+            calibrationController.cancel("CALIBRATION CANCELLED — CAMERA CHANGED")
+        }
         selectedCameraId = id
         getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE).edit()
             .putString(PREF_CAMERA_ID, id)
             .apply()
         updateCameraSelectorLabel()
+        refreshStoredCalibration()
         resetLiveStats()
         synchronized(frameLock) {
             latestFrame?.let { freeFrames.addLast(it) }
@@ -423,7 +543,7 @@ class MainActivity : Activity() {
             ZipDepthService.MSG_RESULT -> {
                 val ok = message.data.getBoolean(ZipDepthService.KEY_OK)
                 val currentResult = inFlightCameraGeneration == cameraGeneration
-                if (ok && currentResult) {
+                if (ok && currentResult && !calibrationActive) {
                     message.data.getFloatArray(ZipDepthService.KEY_METRICS)?.let { values ->
                         values.copyInto(nativeMetrics, endIndex = minOf(values.size, nativeMetrics.size))
                     }
@@ -698,9 +818,15 @@ class MainActivity : Activity() {
         ) {
             request.set(CaptureRequest.LENS_FOCUS_DISTANCE, 0f)
         }
-        if (sharpRear) {
+        if (sharpRear && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             try {
-                request.set(SHARP_TOF_DISABLE, 1.toByte())
+                request.set(
+                    CaptureRequest.Key(
+                        "com.sharp.camera.tofsensor.disable",
+                        Byte::class.javaObjectType,
+                    ),
+                    1.toByte(),
+                )
                 Log.i(TAG, "requested SHARP ToF camera disable")
             } catch (t: Throwable) {
                 Log.w(TAG, "SHARP ToF disable vendor tag was rejected", t)
@@ -725,7 +851,9 @@ class MainActivity : Activity() {
             // Camera analysis is the producer and never waits for QNN. The NPU sees
             // an app-owned copy through a latest-frame mailbox below.
             renderPreview(image)
-            if (modelReady && resumed) {
+            if (calibrationActive) {
+                calibrationController.offer(image)
+            } else if (modelReady && resumed) {
                 publishLatestFrame(image)
             }
         } finally {
@@ -754,7 +882,7 @@ class MainActivity : Activity() {
     }
 
     private fun scheduleInferenceDispatch() {
-        if (!modelReady || npuService == null || !npuBusy.compareAndSet(false, true)) return
+        if (calibrationActive || !modelReady || npuService == null || !npuBusy.compareAndSet(false, true)) return
         try {
             inferenceExecutor.execute { dispatchLatestFrame() }
         } catch (_: Exception) {
@@ -891,16 +1019,23 @@ class MainActivity : Activity() {
         } else {
             0.0
         }
-        val htpLine = if (waitingMs >= 250.0) {
+        val htpLine = if (calibrationActive) {
+            "HTP  PAUSED (CAL)"
+        } else if (waitingMs >= 250.0) {
             String.format(Locale.US, "HTP WAIT %.0f ms", waitingMs)
         } else {
             String.format(Locale.US, "HTP  %5.1f ms", nativeMetrics[2])
         }
+        val depthLine = if (calibrationActive) {
+            "DEPTH PAUSED"
+        } else {
+            String.format(Locale.US, "DEPTH %5.1f fps", depthFps)
+        }
         statsView.text = String.format(
             Locale.US,
-            "CAM   %5.1f fps\nDEPTH %5.1f fps\n%s\nNATIVE%5.1f ms\nROUND %5.1f ms\nE2E   %5.1f ms",
+            "CAM   %5.1f fps\n%s\n%s\nNATIVE%5.1f ms\nROUND %5.1f ms\nE2E   %5.1f ms",
             cameraFps,
-            depthFps,
+            depthLine,
             htpLine,
             nativeMetrics[0],
             dispatchLatencyMs,
@@ -1006,9 +1141,5 @@ class MainActivity : Activity() {
         private const val DEPTH_FRAME_BYTES =
             ZipDepthNative.OUTPUT_WIDTH * ZipDepthNative.OUTPUT_HEIGHT * 4
         private const val SHARED_BUFFER_BYTES = RGB_FRAME_BYTES + DEPTH_FRAME_BYTES
-        private val SHARP_TOF_DISABLE = CaptureRequest.Key(
-            "com.sharp.camera.tofsensor.disable",
-            Byte::class.javaObjectType,
-        )
     }
 }

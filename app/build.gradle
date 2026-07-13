@@ -19,7 +19,9 @@ android {
         }
         externalNativeBuild {
             cmake {
-                arguments '-DANDROID_STL=c++_shared'
+                // The JNI bridge is pure C. Do not inject NDK r21's C++
+                // runtime; OpenCV's AAR supplies the newer runtime it needs.
+                arguments '-DANDROID_STL=none'
             }
         }
     }
@@ -61,4 +63,7 @@ dependencies {
     // The transitive QNN 2.42 package is intentionally absent: the EPContext
     // model and native libraries in jniLibs are the matched QAIRT 2.48 set.
     implementation files('libs/onnxruntime-android-qnn-1.27.0.aar')
+    // Official Android AAR. Calibration runs only while explicitly enabled;
+    // the normal camera + QNN path does not call into OpenCV.
+    implementation 'org.opencv:opencv:4.12.0'
 }
