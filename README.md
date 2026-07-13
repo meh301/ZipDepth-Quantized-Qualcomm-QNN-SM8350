@@ -129,8 +129,8 @@ archive without LFS objects will not produce a working APK.
 
 ```powershell
 git lfs install
-git clone <your-repository-url>
-cd zipdepth_NPU
+git clone https://github.com/meh301/ZipDepth-Quantized-Qualcomm-QNN-SM8350.git
+cd ZipDepth-Quantized-Qualcomm-QNN-SM8350
 git lfs pull
 ```
 
