@@ -47,6 +47,11 @@ application never presents a CPU result as NPU inference.
 - Native YUV-to-RGB conversion, orientation correction, square center crop, and
   384 x 384 resize shared by the preview and model input.
 - Quantized ZipDepth execution through ONNX Runtime QNN EP on Hexagon HTP.
+- Runtime-selectable model variants (a second on-screen picker): seven bundled
+  QNN contexts covering 16-bit and 8-bit activation quantization at 384, 320,
+  288, and 256 px network input, switchable live without reinstalling.
+- An on-device synthetic accuracy test that scores the active variant against
+  bundled fp32 CPU reference depth maps.
 - Camera capture and HTP inference in separate Android processes.
 - Latest-frame backpressure: the camera never waits for the NPU and stale model
   inputs are replaced instead of queued.
@@ -102,6 +107,46 @@ session reports one of:
 QNN HTP - EPContext - all nodes
 QNN HTP - EPContext - CPU I/O boundary
 ```
+
+## Bundled model variants
+
+The **MODEL** picker (below the camera picker) switches between seven precompiled
+SM8350/v68 QNN contexts at runtime. Each variant trades accuracy for speed along
+two axes: activation bit width (A16 = 16-bit, A8 = 8-bit; weights are always
+signed 8-bit per-channel) and network input resolution. Representative
+steady-state `OrtRun` times measured on a Snapdragon 888 device with the camera
+live and default DSP clocks:
+
+| Variant | Activations | Input | `OrtRun` | Quality |
+|---|---|---|---|---|
+| BASE A16 384 (default) | 16-bit | 384 | ~40 ms | reference |
+| A16W8 320 | 16-bit | 320 | ~33 ms | near-reference |
+| A16W8 288 | 16-bit | 288 | ~26 ms | good |
+| A8W8 384 | 8-bit | 384 | ~22 ms | poor |
+| A8W8 320 | 8-bit | 320 | ~23 ms | poor |
+| A8W8 288 | 8-bit | 288 | ~17 ms | poor |
+| A8W8 256 | 8-bit | 256 | ~10-14 ms | poor |
+
+> [!WARNING]
+> The A8W8 (8-bit activation) variants look bad — noticeably so. Depth maps are
+> coarse, structurally unstable, and **flicker frame to frame**. They are bundled
+> solely to measure the HTP's full-INT8 speed envelope (up to ~4x the baseline
+> rate) and are marked with `⚠` in the picker. For anything other than speed
+> measurements, use the A16 variants; **A16W8 320** retains near-baseline
+> accuracy at ~20% lower latency and is the practical sweet spot.
+
+Tapping **TEST ACC** runs the active variant over a bundled six-frame testset and
+reports the affine-aligned inlier ratio (`d1`, threshold 1.25), RMSE, and Pearson
+correlation against fp32 CPU reference depth maps computed from the identical
+inputs. A per-image scale-and-shift fit is applied before scoring because the
+downstream consumer re-anchors relative depth every frame; error that an affine
+fit absorbs is deliberately not charged to the model. Results persist per variant
+and appear in the model picker, building an on-device leaderboard.
+
+The variants were produced with the pipeline in [`tools/variants/`](tools/variants/)
+(BatchNorm folding, QNN-specific QDQ quantization, `qairt-converter`, and
+`qnn-context-binary-generator --htp_socs sm8350` from QAIRT 2.48). The scripts
+reference machine-local SDK paths and are included for reproducibility.
 
 ## Requirements
 
@@ -244,9 +289,12 @@ app/src/main/java/.../MainActivity.kt              Camera, UI, metrics, IPC
 app/src/main/java/.../ZipDepthService.kt            Isolated NPU service
 app/src/main/java/.../CameraCalibrationController.kt Calibration and storage
 app/src/main/cpp/zipdepth_jni.c                     Pre/postprocessing + ORT C API
-app/src/main/assets/zipdepth.onnx                   SM8350/v68 EPContext model
+app/src/main/assets/zipdepth.onnx                   SM8350/v68 EPContext model (default)
+app/src/main/assets/models/                         Quantization/resolution variants
+app/src/main/assets/testset/                        Accuracy-test frames + fp32 references
 app/src/main/jniLibs/arm64-v8a/                     Matched QAIRT/QNN runtime
 app/libs/onnxruntime-android-qnn-1.27.0.aar          ORT Android QNN build
+tools/                                              Variant + testset build pipeline
 calibration_target/                                 Python target and instructions
 DEPENDENCIES.md                                     Binary inventory and hashes
 THIRD_PARTY_NOTICES.md                              Upstream projects and terms

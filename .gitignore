@@ -22,3 +22,12 @@ __pycache__/
 secrets.properties
 captures/
 .DS_Store
+
+# variant build pipeline outputs (tools/variants run in place)
+tools/variants/src/
+tools/variants/dlc/
+tools/variants/ctx/
+tools/variants/golden/
+tools/variants/summary.txt
+tools/variants/backend_ext.json
+tools/variants/htp_config.json
