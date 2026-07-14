@@ -18,9 +18,14 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-#define MODEL_W 384
-#define MODEL_H 384
-#define MODEL_PIXELS (MODEL_W * MODEL_H)
+// FRAME_* is the fixed camera-facing frame: the shared RGB888 input, the preview,
+// and the accuracy testset are always 384x384. The NETWORK input size is variable
+// (256..384 depending on the selected model variant) and is discovered from the
+// ORT session at init; the RGB888 frame is resampled to it in preprocess.
+#define FRAME_W 384
+#define FRAME_H 384
+#define FRAME_PIXELS (FRAME_W * FRAME_H)
+#define MODEL_MAX_PIXELS FRAME_PIXELS
 #define SAMPLE_COUNT 4096
 
 typedef struct {
@@ -34,9 +39,11 @@ typedef struct {
     char output_name[128];
     char backend_name[96];
     char last_error[512];
-    float input[3 * MODEL_PIXELS];
+    int model_w;                          /* network input width, <= FRAME_W */
+    int model_h;                          /* network input height, <= FRAME_H */
+    float input[3 * MODEL_MAX_PIXELS];
     float percentile_samples[SAMPLE_COUNT];
-    jint output_pixels[MODEL_PIXELS];
+    jint output_pixels[MODEL_MAX_PIXELS];
     float low_ema;
     float high_ema;
     int range_ready;
@@ -80,6 +87,12 @@ static void native_library_directory(char *output, size_t output_size) {
 static void configure_fastrpc_paths(const char *directory) {
     const char *old_ld = getenv("LD_LIBRARY_PATH");
     const char *old_adsp = getenv("ADSP_LIBRARY_PATH");
+    // Idempotent: model switches re-run init in the same process; don't stack
+    // duplicate prefixes onto the loader paths on every re-init.
+    if (old_ld && strstr(old_ld, directory) &&
+        old_adsp && strstr(old_adsp, directory)) {
+        return;
+    }
     char path[1600];
     snprintf(path, sizeof(path), "%s%s%s", directory,
              old_ld && old_ld[0] ? ":" : "", old_ld && old_ld[0] ? old_ld : "");
@@ -153,10 +166,11 @@ static int warmup_inference(void) {
     // finalization happens here instead of on the first live frame.
     LOGI("warmup: running the first OrtRun…");
     double t0 = milliseconds();
-    const int64_t shape[] = {1, 3, MODEL_H, MODEL_W};
+    const int64_t shape[] = {1, 3, Z.model_h, Z.model_w};
+    size_t bytes = sizeof(float) * 3 * (size_t)Z.model_w * Z.model_h;
     OrtValue *input_tensor = NULL;
     if (!ort_ok(Z.api->CreateTensorWithDataAsOrtValue(
-                    Z.memory_info, Z.input, sizeof(Z.input), shape, 4,
+                    Z.memory_info, Z.input, bytes, shape, 4,
                     ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor),
                 "warmup CreateTensor")) return 0;
     const char *input_names[] = {Z.input_name};
@@ -191,7 +205,12 @@ static int initialize_ort(const char *model_path) {
     }
     configure_fastrpc_paths(library_directory);
 
-    Z.ort_library = dlopen("libonnxruntime.so", RTLD_NOW | RTLD_LOCAL);
+    // Model switches re-init in the same process: reuse the already-loaded ORT
+    // library rather than dlclosing/dlopening it (QNN backends keep process-wide
+    // state; cycling the library is the risky path, reusing it is the clean one).
+    if (!Z.ort_library) {
+        Z.ort_library = dlopen("libonnxruntime.so", RTLD_NOW | RTLD_LOCAL);
+    }
     if (!Z.ort_library) {
         set_error("dlopen libonnxruntime.so", dlerror());
         return 0;
@@ -234,6 +253,35 @@ static int initialize_ort(const char *model_path) {
                 "SessionGetOutputName")) return 0;
     snprintf(Z.output_name, sizeof(Z.output_name), "%s", name);
     allocator->Free(allocator, name);
+
+    // Discover the network input size from the session so each model variant
+    // (256/288/320/384) drives its own preprocess/postprocess dimensions.
+    Z.model_w = FRAME_W;
+    Z.model_h = FRAME_H;
+    OrtTypeInfo *type_info = NULL;
+    if (ort_ok(Z.api->SessionGetInputTypeInfo(Z.session, 0, &type_info),
+               "SessionGetInputTypeInfo")) {
+        const OrtTensorTypeAndShapeInfo *tensor_info = NULL;
+        if (ort_ok(Z.api->CastTypeInfoToTensorInfo(type_info, &tensor_info),
+                   "CastTypeInfoToTensorInfo") && tensor_info) {
+            int64_t dims[8] = {0};
+            size_t dim_count = 0;
+            Z.api->GetDimensionsCount(tensor_info, &dim_count);
+            if (dim_count == 4 &&
+                !Z.api->GetDimensions(tensor_info, dims, dim_count)) {
+                if (dims[3] >= 64 && dims[3] <= FRAME_W &&
+                    dims[2] >= 64 && dims[2] <= FRAME_H) {
+                    Z.model_w = (int)dims[3];
+                    Z.model_h = (int)dims[2];
+                } else {
+                    LOGE("unexpected model input dims [%lld,%lld,%lld,%lld]; assuming %dx%d",
+                         (long long)dims[0], (long long)dims[1],
+                         (long long)dims[2], (long long)dims[3], FRAME_W, FRAME_H);
+                }
+            }
+        }
+        Z.api->ReleaseTypeInfo(type_info);
+    }
 
     // No HTP burst/power-vote options: this app runs in an UNSIGNED protection
     // domain, where the HTP setPowerConfig (HAP_Power DCVS) call is not permitted
@@ -318,7 +366,7 @@ typedef struct {
     float scale;
 } UprightMap;
 
-static UprightMap upright_map(int width, int height, int rotation) {
+static UprightMap upright_map(int width, int height, int rotation, int target_res) {
     int oriented_width = (rotation == 90 || rotation == 270) ? height : width;
     int oriented_height = (rotation == 90 || rotation == 270) ? width : height;
     int crop = oriented_width < oriented_height ? oriented_width : oriented_height;
@@ -328,7 +376,7 @@ static UprightMap upright_map(int width, int height, int rotation) {
     map.rotation = rotation;
     map.crop_x = (oriented_width - crop) * 0.5f;
     map.crop_y = (oriented_height - crop) * 0.5f;
-    map.scale = (float)crop / MODEL_W;
+    map.scale = (float)crop / target_res;
     return map;
 }
 
@@ -380,19 +428,20 @@ static void preprocess_yuv(const uint8_t *y_plane, const uint8_t *u_plane,
                            int u_pixel_stride, int v_pixel_stride,
                            int y_offset, int u_offset, int v_offset,
                            int rotation) {
-    UprightMap map = upright_map(width, height, rotation);
+    const int model_pixels = Z.model_w * Z.model_h;
+    UprightMap map = upright_map(width, height, rotation, Z.model_w);
     float *red = Z.input;
-    float *green = Z.input + MODEL_PIXELS;
-    float *blue = Z.input + 2 * MODEL_PIXELS;
-    for (int model_y = 0; model_y < MODEL_H; ++model_y) {
-        for (int model_x = 0; model_x < MODEL_W; ++model_x) {
+    float *green = Z.input + model_pixels;
+    float *blue = Z.input + 2 * model_pixels;
+    for (int model_y = 0; model_y < Z.model_h; ++model_y) {
+        for (int model_x = 0; model_x < Z.model_w; ++model_x) {
             float r, g, b;
             sample_upright_rgb(y_plane, u_plane, v_plane, &map,
                                y_row_stride, u_row_stride, v_row_stride,
                                u_pixel_stride, v_pixel_stride,
                                y_offset, u_offset, v_offset,
                                model_x, model_y, &r, &g, &b);
-            int index = model_y * MODEL_W + model_x;
+            int index = model_y * Z.model_w + model_x;
             red[index] = r * (1.0f / 255.0f);
             green[index] = g * (1.0f / 255.0f);
             blue[index] = b * (1.0f / 255.0f);
@@ -400,21 +449,56 @@ static void preprocess_yuv(const uint8_t *y_plane, const uint8_t *u_plane,
     }
 }
 
+// Bilinear sample of one channel of the FRAME_WxFRAME_H RGB888 frame.
+static inline float sample_rgb888(const uint8_t *rgb, float fx, float fy, int channel) {
+    fx = clampf(fx, 0.0f, (float)(FRAME_W - 1));
+    fy = clampf(fy, 0.0f, (float)(FRAME_H - 1));
+    int x0 = (int)fx;
+    int y0 = (int)fy;
+    int x1 = x0 + 1 < FRAME_W ? x0 + 1 : x0;
+    int y1 = y0 + 1 < FRAME_H ? y0 + 1 : y0;
+    float ax = fx - x0;
+    float ay = fy - y0;
+    const uint8_t *row0 = rgb + ((size_t)y0 * FRAME_W) * 3;
+    const uint8_t *row1 = rgb + ((size_t)y1 * FRAME_W) * 3;
+    float top = row0[x0 * 3 + channel] * (1.0f - ax) + row0[x1 * 3 + channel] * ax;
+    float bottom = row1[x0 * 3 + channel] * (1.0f - ax) + row1[x1 * 3 + channel] * ax;
+    return top * (1.0f - ay) + bottom * ay;
+}
+
+// The shared frame is always FRAME_WxFRAME_H RGB888; resample it to the active
+// network's input size. The 384 fast path is a straight /255 conversion.
 static void preprocess_rgb888(const uint8_t *rgb) {
+    const int model_pixels = Z.model_w * Z.model_h;
     float *red = Z.input;
-    float *green = Z.input + MODEL_PIXELS;
-    float *blue = Z.input + 2 * MODEL_PIXELS;
+    float *green = Z.input + model_pixels;
+    float *blue = Z.input + 2 * model_pixels;
     const float scale = 1.0f / 255.0f;
-    for (int index = 0; index < MODEL_PIXELS; ++index) {
-        red[index] = rgb[index * 3] * scale;
-        green[index] = rgb[index * 3 + 1] * scale;
-        blue[index] = rgb[index * 3 + 2] * scale;
+    if (Z.model_w == FRAME_W && Z.model_h == FRAME_H) {
+        for (int index = 0; index < model_pixels; ++index) {
+            red[index] = rgb[index * 3] * scale;
+            green[index] = rgb[index * 3 + 1] * scale;
+            blue[index] = rgb[index * 3 + 2] * scale;
+        }
+        return;
+    }
+    const float sx = (float)FRAME_W / Z.model_w;
+    const float sy = (float)FRAME_H / Z.model_h;
+    for (int model_y = 0; model_y < Z.model_h; ++model_y) {
+        float fy = (model_y + 0.5f) * sy - 0.5f;
+        for (int model_x = 0; model_x < Z.model_w; ++model_x) {
+            float fx = (model_x + 0.5f) * sx - 0.5f;
+            int index = model_y * Z.model_w + model_x;
+            red[index] = sample_rgb888(rgb, fx, fy, 0) * scale;
+            green[index] = sample_rgb888(rgb, fx, fy, 1) * scale;
+            blue[index] = sample_rgb888(rgb, fx, fy, 2) * scale;
+        }
     }
 }
 
 // Preview scratch is written only from the camera thread (single caller), kept
 // separate from Z.output_pixels so preview and NPU inference never share state.
-static jint preview_pixels[MODEL_PIXELS];
+static jint preview_pixels[FRAME_PIXELS];
 
 static int compare_floats(const void *left, const void *right) {
     float a = *(const float *)left;
@@ -422,10 +506,11 @@ static int compare_floats(const void *left, const void *right) {
     return (a > b) - (a < b);
 }
 
-static int estimate_range(const float *depth, float *low, float *high) {
+static int estimate_range(const float *depth, int pixels, float *low, float *high) {
     int count = 0;
-    const int step = MODEL_PIXELS / SAMPLE_COUNT;
-    for (int index = 0; index < MODEL_PIXELS && count < SAMPLE_COUNT; index += step) {
+    int step = pixels / SAMPLE_COUNT;
+    if (step < 1) step = 1;
+    for (int index = 0; index < pixels && count < SAMPLE_COUNT; index += step) {
         float value = depth[index];
         if (isfinite(value)) Z.percentile_samples[count++] = value;
     }
@@ -470,16 +555,22 @@ static uint32_t turbo(float x) {
            ((uint32_t)color_channel(g) << 8) | (uint32_t)color_channel(b);
 }
 
+// Runs the network on Z.input. Exactly one of output_argb (Turbo-colored
+// relative depth) or output_raw (the raw float depth map, for accuracy
+// evaluation) is non-NULL. Both outputs are Z.model_w x Z.model_h.
 static jboolean run_preprocessed(JNIEnv *env, jintArray output_argb,
+                                 jfloatArray output_raw,
                                  jfloatArray metrics, double start,
                                  double after_preprocess, int frame, int trace) {
-    if (trace) LOGI("nativeProcess[%d]: preprocessed in %.1f ms; calling OrtRun",
-                    frame, after_preprocess - start);
+    if (trace) LOGI("nativeProcess[%d]: preprocessed in %.1f ms; calling OrtRun (%dx%d)",
+                    frame, after_preprocess - start, Z.model_w, Z.model_h);
 
-    const int64_t shape[] = {1, 3, MODEL_H, MODEL_W};
+    const int model_pixels = Z.model_w * Z.model_h;
+    const int64_t shape[] = {1, 3, Z.model_h, Z.model_w};
+    size_t input_bytes = sizeof(float) * 3 * (size_t)model_pixels;
     OrtValue *input_tensor = NULL;
     if (!ort_ok(Z.api->CreateTensorWithDataAsOrtValue(
-                    Z.memory_info, Z.input, sizeof(Z.input), shape, 4,
+                    Z.memory_info, Z.input, input_bytes, shape, 4,
                     ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor),
                 "Create input tensor")) return JNI_FALSE;
     const char *input_names[] = {Z.input_name};
@@ -500,20 +591,34 @@ static jboolean run_preprocessed(JNIEnv *env, jintArray output_argb,
         if (output_tensor) Z.api->ReleaseValue(output_tensor);
         return JNI_FALSE;
     }
-    float low, high;
-    if (!estimate_range(depth, &low, &high)) {
-        if (trace) LOGE("nativeProcess[%d]: estimate_range failed (degenerate depth)", frame);
-        Z.api->ReleaseValue(output_tensor);
-        return JNI_FALSE;
-    }
-    float inverse_span = 1.0f / (high - low);
-    for (int index = 0; index < MODEL_PIXELS; ++index) {
-        float value = isfinite(depth[index]) ? depth[index] : high;
-        float near_value = 1.0f - (value - low) * inverse_span;
-        Z.output_pixels[index] = (jint)turbo(near_value);
+    float low = 0.0f, high = 0.0f;
+    if (output_raw) {
+        (*env)->SetFloatArrayRegion(env, output_raw, 0, model_pixels, depth);
+        // Report the frame's raw window without disturbing the display EMA.
+        float raw_low = depth[0], raw_high = depth[0];
+        for (int index = 1; index < model_pixels; ++index) {
+            float value = depth[index];
+            if (!isfinite(value)) continue;
+            if (value < raw_low) raw_low = value;
+            if (value > raw_high) raw_high = value;
+        }
+        low = raw_low;
+        high = raw_high;
+    } else {
+        if (!estimate_range(depth, model_pixels, &low, &high)) {
+            if (trace) LOGE("nativeProcess[%d]: estimate_range failed (degenerate depth)", frame);
+            Z.api->ReleaseValue(output_tensor);
+            return JNI_FALSE;
+        }
+        float inverse_span = 1.0f / (high - low);
+        for (int index = 0; index < model_pixels; ++index) {
+            float value = isfinite(depth[index]) ? depth[index] : high;
+            float near_value = 1.0f - (value - low) * inverse_span;
+            Z.output_pixels[index] = (jint)turbo(near_value);
+        }
+        (*env)->SetIntArrayRegion(env, output_argb, 0, model_pixels, Z.output_pixels);
     }
     Z.api->ReleaseValue(output_tensor);
-    (*env)->SetIntArrayRegion(env, output_argb, 0, MODEL_PIXELS, Z.output_pixels);
     double after_postprocess = milliseconds();
 
     jfloat values[6] = {
@@ -555,7 +660,7 @@ Java_org_zipdepth_npudemo_ZipDepthNative_nativeProcess(
     jint rotation, jintArray output_argb, jfloatArray metrics) {
     (void)ignored;
     if (!Z.ready || !Z.session || width <= 0 || height <= 0) return JNI_FALSE;
-    if ((*env)->GetArrayLength(env, output_argb) < MODEL_PIXELS ||
+    if ((*env)->GetArrayLength(env, output_argb) < Z.model_w * Z.model_h ||
         (*env)->GetArrayLength(env, metrics) < 6) return JNI_FALSE;
 
     const uint8_t *y_plane = (*env)->GetDirectBufferAddress(env, y_buffer);
@@ -578,7 +683,7 @@ Java_org_zipdepth_npudemo_ZipDepthNative_nativeProcess(
                    u_pixel_stride, v_pixel_stride,
                    y_offset, u_offset, v_offset, rotation);
     double after_preprocess = milliseconds();
-    return run_preprocessed(env, output_argb, metrics, start,
+    return run_preprocessed(env, output_argb, NULL, metrics, start,
                             after_preprocess, frame, trace);
 }
 
@@ -593,7 +698,7 @@ Java_org_zipdepth_npudemo_ZipDepthNative_nativePrepareRgb(
     jint rotation, jbyteArray output_rgb) {
     (void)ignored;
     if (width <= 0 || height <= 0 ||
-        (*env)->GetArrayLength(env, output_rgb) < MODEL_PIXELS * 3) return JNI_FALSE;
+        (*env)->GetArrayLength(env, output_rgb) < FRAME_PIXELS * 3) return JNI_FALSE;
 
     const uint8_t *y_plane = (*env)->GetDirectBufferAddress(env, y_buffer);
     const uint8_t *u_plane = (*env)->GetDirectBufferAddress(env, u_buffer);
@@ -604,16 +709,16 @@ Java_org_zipdepth_npudemo_ZipDepthNative_nativePrepareRgb(
 
     jbyte *rgb = (*env)->GetByteArrayElements(env, output_rgb, NULL);
     if (!rgb) return JNI_FALSE;
-    UprightMap map = upright_map(width, height, rotation);
-    for (int model_y = 0; model_y < MODEL_H; ++model_y) {
-        for (int model_x = 0; model_x < MODEL_W; ++model_x) {
+    UprightMap map = upright_map(width, height, rotation, FRAME_W);
+    for (int frame_y = 0; frame_y < FRAME_H; ++frame_y) {
+        for (int frame_x = 0; frame_x < FRAME_W; ++frame_x) {
             float r, g, b;
             sample_upright_rgb(y_plane, u_plane, v_plane, &map,
                                y_row_stride, u_row_stride, v_row_stride,
                                u_pixel_stride, v_pixel_stride,
                                y_offset, u_offset, v_offset,
-                               model_x, model_y, &r, &g, &b);
-            int index = (model_y * MODEL_W + model_x) * 3;
+                               frame_x, frame_y, &r, &g, &b);
+            int index = (frame_y * FRAME_W + frame_x) * 3;
             rgb[index] = (jbyte)(uint8_t)(r + 0.5f);
             rgb[index + 1] = (jbyte)(uint8_t)(g + 0.5f);
             rgb[index + 2] = (jbyte)(uint8_t)(b + 0.5f);
@@ -629,8 +734,8 @@ Java_org_zipdepth_npudemo_ZipDepthNative_nativeProcessRgb(
     jintArray output_argb, jfloatArray metrics) {
     (void)ignored;
     if (!Z.ready || !Z.session ||
-        (*env)->GetArrayLength(env, input_rgb) < MODEL_PIXELS * 3 ||
-        (*env)->GetArrayLength(env, output_argb) < MODEL_PIXELS ||
+        (*env)->GetArrayLength(env, input_rgb) < FRAME_PIXELS * 3 ||
+        (*env)->GetArrayLength(env, output_argb) < Z.model_w * Z.model_h ||
         (*env)->GetArrayLength(env, metrics) < 6) return JNI_FALSE;
 
     static int process_count = 0;
@@ -643,8 +748,40 @@ Java_org_zipdepth_npudemo_ZipDepthNative_nativeProcessRgb(
     preprocess_rgb888((const uint8_t *)rgb);
     (*env)->ReleaseByteArrayElements(env, input_rgb, rgb, JNI_ABORT);
     double after_preprocess = milliseconds();
-    return run_preprocessed(env, output_argb, metrics, start,
+    return run_preprocessed(env, output_argb, NULL, metrics, start,
                             after_preprocess, frame, trace);
+}
+
+// Same as nativeProcessRgb but returns the RAW float depth map (model res) for
+// on-device accuracy evaluation against bundled fp32 references.
+JNIEXPORT jboolean JNICALL
+Java_org_zipdepth_npudemo_ZipDepthNative_nativeProcessRgbRaw(
+    JNIEnv *env, jobject ignored, jbyteArray input_rgb,
+    jfloatArray output_depth, jfloatArray metrics) {
+    (void)ignored;
+    if (!Z.ready || !Z.session ||
+        (*env)->GetArrayLength(env, input_rgb) < FRAME_PIXELS * 3 ||
+        (*env)->GetArrayLength(env, output_depth) < Z.model_w * Z.model_h ||
+        (*env)->GetArrayLength(env, metrics) < 6) return JNI_FALSE;
+
+    double start = milliseconds();
+    jbyte *rgb = (*env)->GetByteArrayElements(env, input_rgb, NULL);
+    if (!rgb) return JNI_FALSE;
+    preprocess_rgb888((const uint8_t *)rgb);
+    (*env)->ReleaseByteArrayElements(env, input_rgb, rgb, JNI_ABORT);
+    double after_preprocess = milliseconds();
+    return run_preprocessed(env, NULL, output_depth, metrics, start,
+                            after_preprocess, 0, 0);
+}
+
+// Network input size of the loaded model (square, e.g. 256/288/320/384), or 0
+// before a successful init.
+JNIEXPORT jint JNICALL
+Java_org_zipdepth_npudemo_ZipDepthNative_nativeModelInputSize(
+    JNIEnv *env, jobject ignored) {
+    (void)env;
+    (void)ignored;
+    return Z.ready ? Z.model_w : 0;
 }
 
 // Cheap YUV -> upright, center-cropped RGB with no NPU. Runs on the camera
@@ -662,7 +799,7 @@ Java_org_zipdepth_npudemo_ZipDepthNative_nativePreview(
     jint rotation, jintArray output_argb) {
     (void)ignored;
     if (width <= 0 || height <= 0) return JNI_FALSE;
-    if ((*env)->GetArrayLength(env, output_argb) < MODEL_PIXELS) return JNI_FALSE;
+    if ((*env)->GetArrayLength(env, output_argb) < FRAME_PIXELS) return JNI_FALSE;
 
     const uint8_t *y_plane = (*env)->GetDirectBufferAddress(env, y_buffer);
     const uint8_t *u_plane = (*env)->GetDirectBufferAddress(env, u_buffer);
@@ -671,23 +808,23 @@ Java_org_zipdepth_npudemo_ZipDepthNative_nativePreview(
     rotation = ((rotation % 360) + 360) % 360;
     if (rotation != 0 && rotation != 90 && rotation != 180 && rotation != 270) rotation = 0;
 
-    UprightMap map = upright_map(width, height, rotation);
-    for (int model_y = 0; model_y < MODEL_H; ++model_y) {
-        for (int model_x = 0; model_x < MODEL_W; ++model_x) {
+    UprightMap map = upright_map(width, height, rotation, FRAME_W);
+    for (int frame_y = 0; frame_y < FRAME_H; ++frame_y) {
+        for (int frame_x = 0; frame_x < FRAME_W; ++frame_x) {
             float r, g, b;
             sample_upright_rgb(y_plane, u_plane, v_plane, &map,
                                y_row_stride, u_row_stride, v_row_stride,
                                u_pixel_stride, v_pixel_stride,
                                y_offset, u_offset, v_offset,
-                               model_x, model_y, &r, &g, &b);
+                               frame_x, frame_y, &r, &g, &b);
             uint32_t argb = 0xFF000000u |
                             ((uint32_t)(int)(r + 0.5f) << 16) |
                             ((uint32_t)(int)(g + 0.5f) << 8) |
                             (uint32_t)(int)(b + 0.5f);
-            preview_pixels[model_y * MODEL_W + model_x] = (jint)argb;
+            preview_pixels[frame_y * FRAME_W + frame_x] = (jint)argb;
         }
     }
-    (*env)->SetIntArrayRegion(env, output_argb, 0, MODEL_PIXELS, preview_pixels);
+    (*env)->SetIntArrayRegion(env, output_argb, 0, FRAME_PIXELS, preview_pixels);
     return JNI_TRUE;
 }
 
@@ -707,7 +844,12 @@ Java_org_zipdepth_npudemo_ZipDepthNative_nativeShutdown(
     Z.session = NULL;
     Z.memory_info = NULL;
     Z.env = NULL;
-    Z.api = NULL;
-    if (Z.ort_library) dlclose(Z.ort_library);
-    Z.ort_library = NULL;
+    Z.range_ready = 0;
+    Z.model_w = 0;
+    Z.model_h = 0;
+    Z.last_error[0] = '\0';
+    // Deliberately keep Z.ort_library (and Z.api validity follows the library):
+    // model switches re-initialize in this same process, and cycling
+    // libonnxruntime/QNN through dlclose is the unreliable path. The library is
+    // reclaimed when the service process exits.
 }

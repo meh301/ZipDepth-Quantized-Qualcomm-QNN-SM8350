@@ -3,6 +3,9 @@ package org.zipdepth.npudemo
 import java.nio.ByteBuffer
 
 object ZipDepthNative {
+    // Fixed camera-facing frame size: the shared RGB888 input, the preview, and
+    // the accuracy testset are always this size. The NETWORK input size varies
+    // per model variant (256..384) — query it with [nativeModelInputSize].
     const val OUTPUT_WIDTH = 384
     const val OUTPUT_HEIGHT = 384
 
@@ -10,8 +13,15 @@ object ZipDepthNative {
         System.loadLibrary("zipdepth_demo")
     }
 
-    /** Returns a human-readable backend description, or an ERROR-prefixed reason. */
+    /**
+     * Returns a human-readable backend description, or an ERROR-prefixed reason.
+     * May be called again after [nativeShutdown] to load a different model in the
+     * same process (model-variant switching).
+     */
     external fun nativeInit(modelPath: String): String
+
+    /** Network input size (square: 256/288/320/384) of the loaded model, 0 if not ready. */
+    external fun nativeModelInputSize(): Int
 
     /**
      * Converts the camera's YUV image to upright center-cropped RGB, executes
@@ -56,10 +66,24 @@ object ZipDepthNative {
         outputRgb: ByteArray,
     ): Boolean
 
-    /** Runs an already cropped RGB888 frame in the camera-free NPU service process. */
+    /**
+     * Runs an already cropped RGB888 frame (OUTPUT_WIDTH x OUTPUT_HEIGHT) in the
+     * camera-free NPU service process. [outputArgb] receives the Turbo-colored
+     * depth at the NETWORK resolution ([nativeModelInputSize] squared).
+     */
     external fun nativeProcessRgb(
         rgb: ByteArray,
         outputArgb: IntArray,
+        metrics: FloatArray,
+    ): Boolean
+
+    /**
+     * Like [nativeProcessRgb] but writes the RAW float depth map (network
+     * resolution squared) for accuracy evaluation against fp32 references.
+     */
+    external fun nativeProcessRgbRaw(
+        rgb: ByteArray,
+        outputDepth: FloatArray,
         metrics: FloatArray,
     ): Boolean
 
